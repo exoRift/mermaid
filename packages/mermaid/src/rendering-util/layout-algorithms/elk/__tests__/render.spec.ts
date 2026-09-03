@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import ELK from 'elkjs/lib/elk.bundled.js';
 import {
   buildElkGraphFromLayoutData,
   buildSubgraphLayoutOptions,
@@ -531,6 +532,297 @@ describe('buildElkGraphFromLayoutData', () => {
         state.nodeDb[id].layoutOptions?.['elk.layered.layering.layerConstraint']
       ).toBeUndefined();
     }
+  });
+});
+
+describe('subgraphs with a direction of their own', () => {
+  const elkContext = {
+    algorithm: 'layered',
+    common: { lineBreakRegex: /<br\s*\/?>/gi },
+    getConfig: () => ({ flowchart: { wrappingWidth: 100 } }),
+    interpolateToCurve: (curve: unknown) => curve,
+    log,
+  } as any;
+
+  /*
+    flowchart TB
+      A --> B
+      subgraph Sub
+        direction LR
+        B1 --> B2 --> B3
+      end
+      B --> B1
+      B3 --> C
+  */
+  const dataWithEdgesIntoSubgraph = (subgraphDir?: string, direction = 'TB') =>
+    ({
+      direction,
+      config: { elk: {} },
+      nodes: [
+        { id: 'A', isGroup: false, width: 60, height: 30, label: 'A' },
+        { id: 'B', isGroup: false, width: 60, height: 30, label: 'B' },
+        { id: 'C', isGroup: false, width: 60, height: 30, label: 'C' },
+        {
+          id: 'Sub',
+          isGroup: true,
+          label: 'Sub',
+          padding: 8,
+          labelBBox: { width: 40, height: 16 },
+          dir: subgraphDir,
+        },
+        { id: 'B1', isGroup: false, parentId: 'Sub', width: 60, height: 30, label: 'B1' },
+        { id: 'B2', isGroup: false, parentId: 'Sub', width: 60, height: 30, label: 'B2' },
+        { id: 'B3', isGroup: false, parentId: 'Sub', width: 60, height: 30, label: 'B3' },
+      ],
+      edges: [
+        { id: 'e0', start: 'A', end: 'B', type: 'arrow_point' },
+        { id: 'e1', start: 'B1', end: 'B2', type: 'arrow_point' },
+        { id: 'e2', start: 'B2', end: 'B3', type: 'arrow_point' },
+        { id: 'e3', start: 'B', end: 'B1', type: 'arrow_point' },
+        { id: 'e4', start: 'B3', end: 'C', type: 'arrow_point' },
+      ],
+    }) as any;
+
+  const endpointsOf = (state: any, id: string) => {
+    const edge = state.elkGraph.edges.find((e: any) => e.id === id);
+    return [edge.sources[0], edge.targets[0]];
+  };
+
+  it('splits an edge pointing at a node inside a subgraph at a port on its frame', async () => {
+    const state = buildElkGraphFromLayoutData(dataWithEdgesIntoSubgraph('LR'), elkContext);
+
+    // `elk.layered` only honours a container's own direction under SEPARATE_CHILDREN, and
+    // refuses to route an edge crossing into one. A hierarchical port is its own way
+    // across: the outer half runs to the port, the inner half from the port to the node,
+    // and ELK routes both like any other edge.
+    expect(state.nodeDb.Sub.layoutOptions?.['elk.direction']).toBe('RIGHT');
+    expect(state.nodeDb.Sub.layoutOptions?.['elk.hierarchyHandling']).toBe('SEPARATE_CHILDREN');
+    expect(endpointsOf(state, 'e3')).toEqual(['B', 'e3__entry0']);
+    expect(endpointsOf(state, 'e4')).toEqual(['e4__exit0', 'C']);
+
+    // The ports sit on the sides the subgraph's OWN flow enters and leaves by — WEST and
+    // EAST for its LR — where ELK lines them up with the nodes they serve, so the
+    // attachment legs run straight instead of crawling along the border to a corner.
+    expect(state.nodeDb.Sub.layoutOptions?.['elk.portConstraints']).toBe('FIXED_SIDE');
+    expect(
+      state.nodeDb.Sub.ports?.map((port: any) => [port.id, port.layoutOptions['elk.port.side']])
+    ).toEqual([
+      ['e3__entry0', 'WEST'],
+      ['e4__exit0', 'EAST'],
+    ]);
+    expect(
+      (state.nodeDb.Sub as any).edges.map((e: any) => [e.id, e.sources[0], e.targets[0]])
+    ).toEqual([
+      ['e3__to0', 'e3__entry0', 'B1'],
+      ['e4__from0', 'B3', 'e4__exit0'],
+    ]);
+
+    // Placement that straightens edges would line each port up with the node it serves and
+    // walk every container down the page to match; SIMPLE keeps the frames in a row.
+    expect(state.elkGraph.layoutOptions['elk.layered.nodePlacement.strategy']).toBe('SIMPLE');
+
+    // Inside a ported frame the author's own edges outrank the port edges for
+    // straightness, so a port's dummy node moves aside instead of shoving a chain's
+    // nodes out of their column and putting a dog-leg in the middle of it.
+    const straightness = (id: string) =>
+      state.elkGraph.edges.find((e: any) => e.id === id)?.layoutOptions?.[
+        'elk.layered.priority.straightness'
+      ];
+    expect(straightness('e1')).toBe(10);
+    expect(straightness('e2')).toBe(10);
+    expect(straightness('e0')).toBeUndefined();
+    expect(straightness('e3')).toBeUndefined();
+
+    // The halves are stitched back into the one edge the author wrote, clipped to their
+    // own nodes — and the diagram's edge still names those nodes.
+    const e3 = state.elkGraph.edges.find((e: any) => e.id === 'e3');
+    expect(e3.terminalTarget).toBe('B1');
+    expect(e3.innerSegments).toEqual([{ id: 'e3__to0', containerId: 'Sub', position: 'end' }]);
+    const source = dataWithEdgesIntoSubgraph('LR').edges[3];
+    expect([source.start, source.end]).toEqual(['B', 'B1']);
+
+    // @ts-ignore - ELK is not typed
+    const laidOut = await new ELK().layout(state.elkGraph);
+    const sub = laidOut.children!.find((c: any) => c.id === 'Sub') as any;
+    const inner = sub.children.map((c: any) => ({ x: Math.round(c.x), y: Math.round(c.y) }));
+    // Left to right: x advances, and all three share a row.
+    expect(inner[0].x).toBeLessThan(inner[1].x);
+    expect(inner[1].x).toBeLessThan(inner[2].x);
+    expect(new Set(inner.map((n: any) => n.y)).size).toBe(1);
+    // ELK routed the inner halves rather than leaving them to be drawn by hand.
+    expect(sub.edges.find((e: any) => e.id === 'e3__to0').sections).toHaveLength(1);
+  });
+
+  it('folds a subgraph without a direction into the root layout as before', () => {
+    const state = buildElkGraphFromLayoutData(dataWithEdgesIntoSubgraph(undefined), elkContext);
+
+    expect(state.nodeDb.Sub.layoutOptions?.['elk.hierarchyHandling']).toBe('INCLUDE_CHILDREN');
+    expect(endpointsOf(state, 'e3')).toEqual(['B', 'B1']);
+  });
+
+  it('folds a subgraph whose direction matches the one it inherits', () => {
+    // TD and TB are the same direction, so this subgraph has nothing of its own to keep
+    // — which matters for `inheritDir`, where every subgraph carries its parent's.
+    const state = buildElkGraphFromLayoutData(dataWithEdgesIntoSubgraph('TD', 'TB'), elkContext);
+
+    expect(state.nodeDb.Sub.layoutOptions?.['elk.hierarchyHandling']).toBe('INCLUDE_CHILDREN');
+    expect(endpointsOf(state, 'e3')).toEqual(['B', 'B1']);
+  });
+
+  it('lays out a style-shrunken junction node at its styled size, not its label size', () => {
+    const state = buildElkGraphFromLayoutData(
+      {
+        direction: 'LR',
+        config: { elk: {} },
+        nodes: [
+          { id: 'A', isGroup: false, width: 60, height: 30, label: 'A' },
+          {
+            id: 'j',
+            isGroup: false,
+            width: 113,
+            height: 27,
+            label: 'j',
+            cssStyles: ['width: 1px', 'height: 1px', 'opacity: 0'],
+          },
+          {
+            id: 'viaClassDef',
+            isGroup: false,
+            width: 113,
+            height: 27,
+            label: 'viaClassDef',
+            cssCompiledStyles: ['width: 1px', 'height: 1px', 'opacity: 0'],
+          },
+          {
+            id: 'dot',
+            isGroup: false,
+            width: 90,
+            height: 27,
+            label: 'dot',
+            cssStyles: ['width: 10px', 'height: 10px'],
+          },
+          {
+            id: 'small',
+            isGroup: false,
+            width: 200,
+            height: 40,
+            label: 'small',
+            // A real text node squeezed by style keeps its measured size for layout: only
+            // point-marker sizes are honoured.
+            cssStyles: ['width: 40px', 'height: 40px'],
+          },
+        ],
+        edges: [],
+      } as any,
+      elkContext
+    );
+
+    expect([state.nodeDb.j.width, state.nodeDb.j.height]).toEqual([1, 1]);
+    // `classDef` is the idiom, and it compiles to `cssCompiledStyles` rather than the
+    // `cssStyles` a bare `style` lands in — reading only the latter missed every one.
+    expect([state.nodeDb.viaClassDef.width, state.nodeDb.viaClassDef.height]).toEqual([1, 1]);
+    // A visible marker — a green junction dot — counts too: it is small because it was
+    // told to be, not because the shape is small, and that is what tells it apart from a
+    // state diagram's start circle.
+    expect([state.nodeDb.dot.width, state.nodeDb.dot.height]).toEqual([10, 10]);
+    expect([state.nodeDb.small.width, state.nodeDb.small.height]).toEqual([200, 40]);
+    expect(state.nodeDb.A.width).toBe(60);
+  });
+
+  it('leaves the root placement alone when nothing is split', () => {
+    const state = buildElkGraphFromLayoutData(dataWithEdgesIntoSubgraph(undefined), elkContext);
+    expect(state.elkGraph.layoutOptions['elk.layered.nodePlacement.strategy']).not.toBe('SIMPLE');
+  });
+
+  it('ports every directed frame between the edge and a nested node', () => {
+    /*
+      flowchart TB
+        X --> i1
+        subgraph Outer
+          direction LR
+          subgraph Inner
+            direction BT
+            i1 --> i2
+          end
+        end
+    */
+    const state = buildElkGraphFromLayoutData(
+      {
+        direction: 'TB',
+        config: { elk: {} },
+        nodes: [
+          { id: 'X', isGroup: false, width: 60, height: 30, label: 'X' },
+          { id: 'Outer', isGroup: true, label: 'Outer', padding: 8, dir: 'LR' },
+          { id: 'Inner', isGroup: true, label: 'Inner', padding: 8, parentId: 'Outer', dir: 'BT' },
+          { id: 'i1', isGroup: false, parentId: 'Inner', width: 60, height: 30, label: 'i1' },
+          { id: 'i2', isGroup: false, parentId: 'Inner', width: 60, height: 30, label: 'i2' },
+        ],
+        edges: [
+          { id: 'inner', start: 'i1', end: 'i2', type: 'arrow_point' },
+          { id: 'cross', start: 'X', end: 'i1', type: 'arrow_point' },
+        ],
+      } as any,
+      elkContext
+    );
+
+    // A port on the outermost frame alone would leave the piece inside it still crossing
+    // `Inner`, which ELK will not route — so each directed frame gets a port of its own,
+    // and the pieces hand the edge inward: outer -> Outer's port, across Outer to Inner's
+    // port, and inside Inner to the node.
+    expect(endpointsOf(state, 'cross')).toEqual(['X', 'cross__entry0']);
+    const cross = state.elkGraph.edges.find((e: any) => e.id === 'cross');
+    expect(cross.innerSegments).toEqual([
+      { id: 'cross__to0', containerId: 'Outer', position: 'end' },
+      { id: 'cross__to1', containerId: 'Inner', position: 'end' },
+    ]);
+    expect(
+      (state.nodeDb.Outer as any).edges.map((e: any) => [e.id, e.sources[0], e.targets[0]])
+    ).toEqual([['cross__to0', 'cross__entry0', 'cross__entry1']]);
+    expect(
+      (state.nodeDb.Inner as any).edges.map((e: any) => [e.id, e.sources[0], e.targets[0]])
+    ).toEqual([['cross__to1', 'cross__entry1', 'i1']]);
+    expect(cross.terminalTarget).toBe('i1');
+  });
+
+  it('ports the frame the edge crosses, not the plain frames around it', () => {
+    /*
+      flowchart TB
+        X --> i1
+        subgraph Outer
+          subgraph Inner
+            direction LR
+            i1 --> i2
+          end
+        end
+    */
+    const state = buildElkGraphFromLayoutData(
+      {
+        direction: 'TB',
+        config: { elk: {} },
+        nodes: [
+          { id: 'X', isGroup: false, width: 60, height: 30, label: 'X' },
+          { id: 'Outer', isGroup: true, label: 'Outer', padding: 8 },
+          { id: 'Inner', isGroup: true, label: 'Inner', padding: 8, parentId: 'Outer', dir: 'LR' },
+          { id: 'i1', isGroup: false, parentId: 'Inner', width: 60, height: 30, label: 'i1' },
+          { id: 'i2', isGroup: false, parentId: 'Inner', width: 60, height: 30, label: 'i2' },
+        ],
+        edges: [
+          { id: 'inner', start: 'i1', end: 'i2', type: 'arrow_point' },
+          { id: 'cross', start: 'X', end: 'i1', type: 'arrow_point' },
+        ],
+      } as any,
+      elkContext
+    );
+
+    expect(endpointsOf(state, 'cross')).toEqual(['X', 'cross__entry0']);
+    const cross = state.elkGraph.edges.find((e: any) => e.id === 'cross');
+    expect(cross.innerSegments).toEqual([
+      { id: 'cross__to0', containerId: 'Inner', position: 'end' },
+    ]);
+    expect(cross.terminalTarget).toBe('i1');
+    expect(state.nodeDb.Inner.layoutOptions?.['elk.hierarchyHandling']).toBe('SEPARATE_CHILDREN');
+    // `Outer` declares no direction of its own, so it still takes the relaxation the
+    // edge crossing its frame calls for.
+    expect(state.nodeDb.Outer.layoutOptions?.['elk.hierarchyHandling']).toBe('INCLUDE_CHILDREN');
   });
 });
 
@@ -1309,5 +1601,49 @@ describe('resolveElkPreset', () => {
   it('falls back to default for an unknown name, including __proto__', () => {
     expect(resolveElkPreset('nope')).toEqual(resolveElkPreset('default'));
     expect(resolveElkPreset('__proto__')).toEqual(resolveElkPreset('default'));
+  });
+});
+
+describe('markers sit where their edges meet', () => {
+  // `classDef junction width:10px,height:10px` draws a visible dot. The layout puts such
+  // a node at the centre of its own box, but ELK attaches the edges a few pixels to one
+  // side, so the dot floated clear of the lines it was meant to join. Everything arriving
+  // at one lands within its radius now.
+  it('lands every edge on a junction dot for a fanning junction', async () => {
+    const junction = ['width: 10px', 'height: 10px', 'fill:#32a852'];
+    const data = {
+      direction: 'LR',
+      config: { elk: {} },
+      nodes: [
+        { id: 'in', isGroup: false, width: 90, height: 40, label: 'in' },
+        {
+          id: 'j',
+          isGroup: false,
+          width: 120,
+          height: 30,
+          label: 'j',
+          cssCompiledStyles: junction,
+        },
+        { id: 'a', isGroup: false, width: 200, height: 40, label: 'a' },
+        { id: 'b', isGroup: false, width: 90, height: 40, label: 'b' },
+      ],
+      edges: [
+        { id: 'e0', start: 'in', end: 'j', type: 'arrow_point' },
+        { id: 'e1', start: 'j', end: 'a', type: 'arrow_point' },
+        { id: 'e2', start: 'j', end: 'b', type: 'arrow_point' },
+      ],
+    } as any;
+
+    await runElkLayoutCore(data, elkRenderContext);
+
+    const dot = data.nodes.find((node: any) => node.id === 'j');
+    expect([dot.width, dot.height]).toEqual([10, 10]);
+    const radius = dot.width / 2;
+    for (const edge of data.edges) {
+      const meeting = edge.start === 'j' ? edge.points[0] : edge.points.at(-1);
+      const gap = Math.hypot(meeting.x - dot.x, meeting.y - dot.y) - radius;
+      // On the dot, give or take the rounding of a corner beside it.
+      expect(gap).toBeLessThan(2);
+    }
   });
 });

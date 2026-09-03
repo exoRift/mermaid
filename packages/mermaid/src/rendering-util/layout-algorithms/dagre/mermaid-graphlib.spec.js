@@ -3,6 +3,7 @@ import * as graphlib from 'dagre-d3-es/src/graphlib/index.js';
 import {
   validate,
   adjustClustersAndEdges,
+  clear,
   extractDescendants,
   sortNodesByHierarchy,
 } from './mermaid-graphlib.js';
@@ -504,5 +505,187 @@ describe('sortNodesByHierarchy', function () {
     g.setNode('b', { data: 2 });
     g.setEdge('a', 'b', '1');
     expect(sortNodesByHierarchy(g)).toEqual(['a', 'A', 'B', 'b']);
+  });
+});
+
+describe('Subgraphs with a direction of their own', function () {
+  /**
+   * Dagre lays out a graph with a single `rankdir`, so a subgraph only keeps its own
+   * direction when it is extracted into a graph of its own. An extracted subgraph shows
+   * up as a `clusterNode` carrying that graph; one that was left in place does not.
+   */
+  const subgraphRankdir = (g, id) => g.node(id)?.graph?.graph()?.rankdir;
+
+  let g;
+  beforeEach(function () {
+    setLogLevel(1);
+    // The cluster bookkeeping is module-level state shared with every other suite here.
+    clear();
+    g = new graphlib.Graph({ multigraph: true, compound: true });
+    g.setGraph({ rankdir: 'TB', nodesep: 10, ranksep: 10, marginx: 8, marginy: 8 });
+    g.setDefaultEdgeLabel(function () {
+      return {};
+    });
+  });
+
+  /**
+   * flowchart TB
+   *   A --> B
+   *   subgraph Sub
+   *     direction LR
+   *     B1 --> B2
+   *   end
+   *   B --> B1
+   *   B2 --> C
+   */
+  const graphWithEdgesIntoSubgraph = (g, subgraphData) => {
+    g.setNode('A', {});
+    g.setNode('B', {});
+    g.setNode('C', {});
+    g.setNode('Sub', subgraphData);
+    for (const id of ['B1', 'B2']) {
+      g.setNode(id, {});
+      g.setParent(id, 'Sub');
+    }
+    g.setEdge('A', 'B', {}, 'a-b');
+    g.setEdge('B1', 'B2', {}, 'b1-b2');
+    g.setEdge('B', 'B1', {}, 'into');
+    g.setEdge('B2', 'C', {}, 'out-of');
+  };
+
+  it('keeps its direction when an edge points at a node inside it', function () {
+    graphWithEdgesIntoSubgraph(g, { dir: 'LR' });
+    adjustClustersAndEdges(g);
+
+    expect(subgraphRankdir(g, 'Sub')).toBe('LR');
+    // Dagre lays the edges out against the frame, since it cannot route into a graph it
+    // lays out separately.
+    expect(g.edges()).toEqual([
+      { v: 'A', w: 'B', name: 'a-b' },
+      { v: 'B', w: 'Sub', name: 'into' },
+      { v: 'Sub', w: 'C', name: 'out-of' },
+    ]);
+    // The node the author wrote is kept, so the painted edge can carry on across the
+    // frame and finish on it rather than stopping at the subgraph's border.
+    expect(g.edge('B', 'Sub', 'into')).toMatchObject({
+      terminalEnd: 'B1',
+      terminalEndAnchor: 'Sub',
+    });
+    expect(g.edge('Sub', 'C', 'out-of')).toMatchObject({
+      terminalStart: 'B2',
+      terminalStartAnchor: 'Sub',
+    });
+  });
+
+  it('is left in place when it declares no direction', function () {
+    graphWithEdgesIntoSubgraph(g, {});
+    adjustClustersAndEdges(g);
+
+    expect(g.node('Sub').clusterNode).toBeUndefined();
+    expect(g.edges()).toContainEqual({ v: 'B', w: 'B1', name: 'into' });
+    expect(g.edge('B', 'B1', 'into').terminalEnd).toBeUndefined();
+  });
+
+  it('is left in place when its direction matches the one it inherits', function () {
+    // TD and TB are the same direction, so this subgraph has nothing of its own to keep.
+    graphWithEdgesIntoSubgraph(g, { dir: 'TD' });
+    adjustClustersAndEdges(g);
+
+    expect(g.node('Sub').clusterNode).toBeUndefined();
+    expect(g.edges()).toContainEqual({ v: 'B', w: 'B1', name: 'into' });
+  });
+
+  it('keeps both directions for an edge running between two of them', function () {
+    /*
+      flowchart TB
+        subgraph S1
+          direction LR
+          a1 --> a2
+        end
+        subgraph S2
+          direction BT
+          b1 --> b2
+        end
+        a2 --> b1
+    */
+    g.setNode('S1', { dir: 'LR' });
+    g.setNode('S2', { dir: 'BT' });
+    for (const id of ['a1', 'a2']) {
+      g.setNode(id, {});
+      g.setParent(id, 'S1');
+    }
+    for (const id of ['b1', 'b2']) {
+      g.setNode(id, {});
+      g.setParent(id, 'S2');
+    }
+    g.setEdge('a1', 'a2', {}, 'a');
+    g.setEdge('b1', 'b2', {}, 'b');
+    g.setEdge('a2', 'b1', {}, 'cross');
+    adjustClustersAndEdges(g);
+
+    expect(subgraphRankdir(g, 'S1')).toBe('LR');
+    expect(subgraphRankdir(g, 'S2')).toBe('BT');
+    expect(g.edges()).toEqual([{ v: 'S1', w: 'S2', name: 'cross' }]);
+    expect(g.edge('S1', 'S2', 'cross')).toMatchObject({
+      terminalStart: 'a2',
+      terminalStartAnchor: 'S1',
+      terminalEnd: 'b1',
+      terminalEndAnchor: 'S2',
+    });
+  });
+
+  it('anchors on the outermost frame the edge crosses', function () {
+    /*
+      flowchart TB
+        subgraph Outer
+          subgraph Inner
+            direction LR
+            i1 --> i2
+          end
+        end
+        X --> i1
+    */
+    g.setNode('X', {});
+    g.setNode('Outer', {});
+    g.setNode('Inner', { dir: 'LR' });
+    g.setParent('Inner', 'Outer');
+    for (const id of ['i1', 'i2']) {
+      g.setNode(id, {});
+      g.setParent(id, 'Inner');
+    }
+    g.setEdge('i1', 'i2', {}, 'inner');
+    g.setEdge('X', 'i1', {}, 'cross');
+    adjustClustersAndEdges(g);
+
+    // `Outer` declares nothing, so the edge only has to clear `Inner`'s frame.
+    expect(subgraphRankdir(g, 'Inner')).toBe('LR');
+    expect(g.edges()).toEqual([{ v: 'X', w: 'Inner', name: 'cross' }]);
+    expect(g.edge('X', 'Inner', 'cross')).toMatchObject({
+      terminalEnd: 'i1',
+      terminalEndAnchor: 'Inner',
+    });
+  });
+
+  it('leaves an edge alone when both of its ends would land on the same frame', function () {
+    /*
+      flowchart TB
+        subgraph Sub
+          direction LR
+          s1 --> s2
+        end
+        s1 --> Sub
+    */
+    g.setNode('Sub', { dir: 'LR' });
+    for (const id of ['s1', 's2']) {
+      g.setNode(id, {});
+      g.setParent(id, 'Sub');
+    }
+    g.setEdge('s1', 's2', {}, 'inner');
+    g.setEdge('s1', 'Sub', {}, 'to-own-frame');
+
+    expect(() => adjustClustersAndEdges(g)).not.toThrow();
+    // Nothing to anchor it on but its own frame, so the subgraph keeps the treatment it
+    // has always had: laid out along with everything around it.
+    expect(g.node('Sub').clusterNode).toBeUndefined();
   });
 });

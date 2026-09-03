@@ -14,6 +14,13 @@ import {
 import { positionNode, setNodeElem } from '../../rendering-elements/nodes.js';
 import { insertCluster } from '../../rendering-elements/clusters.js';
 import { insertEdgeLabel, positionEdgeLabel, insertEdge } from '../../rendering-elements/edges.js';
+import intersectRect from '../../rendering-elements/intersect/intersect-rect.js';
+import {
+  FRAME_CLEARANCE,
+  flowSides,
+  routeClusterCrossing,
+  toBox,
+} from '../common/clusterCrossingRoute.js';
 import { log } from '../../../logger.js';
 import { getSubGraphTitleMargins } from '../../../utils/subGraphTitleMargins.js';
 import { getConfig } from '../../../diagram-api/diagramAPI.js';
@@ -254,6 +261,137 @@ export const getEdgesToRender = (graph, yOffset = 0, { mergeSelfLoops = true } =
   });
 
   return edgesToRender;
+};
+
+/**
+ * Where a node inside an extracted subgraph ended up in its parent's coordinates, along
+ * with the frame around it and the other nodes sharing it.
+ *
+ * An extracted subgraph is laid out and painted into a group of its own, so the nodes
+ * inside carry coordinates relative to that group. `positionNode` then translates the
+ * group; mirroring that translation — including the padding it hard-codes — puts an
+ * inner node back on the parent's canvas. Nested subgraphs are walked through, since a
+ * subgraph inside a subgraph is extracted the same way.
+ */
+const CLUSTER_GROUP_PADDING = 8;
+const resolveTerminal = (graph, clusterId, terminalId) => {
+  if (!terminalId) {
+    return undefined;
+  }
+
+  const search = (cluster, offsetX, offsetY) => {
+    if (!cluster?.clusterNode || !cluster.graph) {
+      return undefined;
+    }
+    const originX = offsetX + cluster.x + (cluster.diff || 0) - cluster.width / 2;
+    const originY = offsetY + cluster.y - cluster.height / 2 - CLUSTER_GROUP_PADDING;
+    const place = (node) => ({
+      x: originX + node.x,
+      y: originY + node.y,
+      width: node.width,
+      height: node.height,
+    });
+
+    const inner = cluster.graph.node(terminalId);
+    if (inner) {
+      const target = toBox(place(inner));
+      const boxes = cluster.graph
+        .nodes()
+        .filter((id) => id !== terminalId)
+        .map((id) => cluster.graph.node(id))
+        .filter((node) => typeof node?.x === 'number' && node.width && node.height)
+        .map((node) => toBox(place(node)));
+      return {
+        node: {
+          ...place(inner),
+          intersect(point) {
+            return intersectRect(this, point);
+          },
+        },
+        // The subgraph carries a box of its own inside its graph, and that is the frame
+        // as painted — more dependable than reconstructing it from the group's translate.
+        frame: boxes.find((box) => contains(box, target)) ?? {
+          left: originX,
+          top: originY,
+          right: originX + cluster.width,
+          bottom: originY + cluster.height,
+        },
+        // What the crossing leg has to steer around: everything laid out beside the
+        // target. Anything the target sits inside is a container, not an obstacle.
+        obstacles: boxes.filter((box) => !contains(box, target)),
+        dir: cluster.graph.graph()?.rankdir,
+      };
+    }
+
+    // Not at this level: the terminal sits inside a subgraph that was extracted in turn.
+    for (const id of cluster.graph.nodes()) {
+      const found = search(cluster.graph.node(id), originX, originY);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  };
+
+  return search(graph.node(clusterId), 0, 0);
+};
+
+const contains = (outer, inner) =>
+  outer.left <= inner.left &&
+  outer.right >= inner.right &&
+  outer.top <= inner.top &&
+  outer.bottom >= inner.bottom;
+
+/** Inside the frame, or close enough to it to read as being drawn on it. */
+const isInsideFrame = (frame, point) =>
+  point.x > frame.left - FRAME_CLEARANCE &&
+  point.x < frame.right + FRAME_CLEARANCE &&
+  point.y > frame.top - FRAME_CLEARANCE &&
+  point.y < frame.bottom + FRAME_CLEARANCE;
+
+/**
+ * Replace the leg dagre aimed at a subgraph's frame with one routed to the node inside.
+ *
+ * Dagre stopped at the frame because it lays that subgraph out separately and cannot see
+ * in. The points it produced outside the frame are kept; from there the leg is routed
+ * around whatever the subgraph holds, and the node's own centre closes it off so the
+ * painter clips the last segment to its border.
+ */
+const applyClusterCrossingRoute = (graph, edge, side) => {
+  const terminalId = side === 'end' ? edge.terminalEnd : edge.terminalStart;
+  const anchorId = side === 'end' ? edge.terminalEndAnchor : edge.terminalStartAnchor;
+  if (!terminalId || !anchorId || !edge.points?.length) {
+    return;
+  }
+  const terminal = resolveTerminal(graph, anchorId, terminalId);
+  if (!terminal) {
+    return;
+  }
+
+  // Walk the edge from the far end, so both directions are the same problem.
+  const points = side === 'end' ? [...edge.points] : [...edge.points].reverse();
+  const outside = points.filter((point) => !isInsideFrame(terminal.frame, point));
+  const flow = flowSides(terminal.dir);
+  const route = routeClusterCrossing({
+    frame: terminal.frame,
+    target: toBox(terminal.node),
+    obstacles: terminal.obstacles,
+    approach: outside[outside.length - 1] ?? points[0],
+    preferSide: side === 'end' ? flow.entry : flow.exit,
+  });
+  if (!route) {
+    return;
+  }
+
+  const routed = [...outside, ...route, { x: terminal.node.x, y: terminal.node.y }];
+  edge.points = side === 'end' ? routed : routed.reverse();
+};
+
+const applyClusterCrossingRoutes = (graph, edges) => {
+  for (const edge of edges) {
+    applyClusterCrossingRoute(graph, edge, 'end');
+    applyClusterCrossingRoute(graph, edge, 'start');
+  }
 };
 
 const measureDagreGraph = async ({
@@ -523,6 +661,8 @@ export const applyDagreLayoutResult = (data4Layout, measuredLayout) => {
   data4Layout.edges = getEdgesToRender(graph, edgeOffsetY, { mergeSelfLoops }).map(
     ({ edge, start, end }) => normalizeDagreEdge(edge, start, end, edgeOffsetY)
   );
+  // After the nodes above: the route is built from where the subgraphs finally landed.
+  applyClusterCrossingRoutes(graph, data4Layout.edges);
 
   return data4Layout;
 };
@@ -625,7 +765,23 @@ const paintDagreLayoutCore = async ({
     edge.points.forEach((point) => (point.y += edgeOffsetY));
     const startNode = graph.node(start);
     const endNode = graph.node(end);
-    const paths = insertEdge(edgePaths, edge, clusterDb, diagramType, startNode, endNode, id);
+
+    // The offset above is already in these points and the route is built from final
+    // positions, so the crossing legs have to be routed after it.
+    applyClusterCrossingRoute(graph, edge, 'end');
+    applyClusterCrossingRoute(graph, edge, 'start');
+    const terminalTail = resolveTerminal(graph, edge.terminalStartAnchor, edge.terminalStart);
+    const terminalHead = resolveTerminal(graph, edge.terminalEndAnchor, edge.terminalEnd);
+
+    const paths = insertEdge(
+      edgePaths,
+      edge,
+      clusterDb,
+      diagramType,
+      terminalTail?.node ?? startNode,
+      terminalHead?.node ?? endNode,
+      id
+    );
     positionEdgeLabel(edge, paths);
   });
 
@@ -801,8 +957,40 @@ const getDagrePaintNodes = (_data4Layout, { measure }) =>
     .map((nodeId) => measure.graph.node(nodeId))
     .filter(Boolean);
 
-const getDagreEdgeNode = (nodeId, _edge, { measure }) =>
-  nodeId ? measure.graph.node(nodeId) : undefined;
+const getDagreEdgeNode = (nodeId, edge, { measure }) => {
+  if (!nodeId) {
+    return undefined;
+  }
+  // The node the author wrote is inside a subgraph that was laid out on its own, so it
+  // is no longer in this graph — `resolveTerminal` finds it and says where it ended
+  // up, which is what lets the edge finish on the node rather than on the frame.
+  const anchor =
+    (nodeId === edge?.terminalStart && edge.terminalStartAnchor) ||
+    (nodeId === edge?.terminalEnd && edge.terminalEndAnchor);
+  if (anchor) {
+    const terminal = resolveTerminal(measure.graph, anchor, nodeId);
+    if (terminal) {
+      return terminal.node;
+    }
+  }
+  return measure.graph.node(nodeId);
+};
+
+/**
+ * The layer for an edge that finishes on a node inside an extracted subgraph.
+ *
+ * Such a subgraph is painted into `groups.nodes`, which is inserted last and so covers
+ * `groups.edgePaths` — the leg of the edge that crosses the frame would be painted
+ * underneath the subgraph's own background and disappear. A group added after `nodes`,
+ * carrying the same classes so the edge keeps its styling, puts it back on top.
+ */
+const getDagreEdgeGroup = (edge, groups) => {
+  if (!edge?.terminalStart && !edge?.terminalEnd) {
+    return undefined;
+  }
+  groups.edgePathsOverTheTop ??= groups.rootGroups.append('g').attr('class', 'edges edgePaths');
+  return groups.edgePathsOverTheTop;
+};
 
 export const render = createCommonLayoutRenderer({
   prepareLayout: prepareLayoutForDagre,
@@ -812,6 +1000,7 @@ export const render = createCommonLayoutRenderer({
     clusterDb,
     getNodes: getDagrePaintNodes,
     getEdgeNode: getDagreEdgeNode,
+    getEdgeGroup: getDagreEdgeGroup,
     skipNode: (node, { measure }) => !measure.graph.hasNode(node.id),
     isCluster: (node, { measure }) =>
       measure.graph.hasNode(node.id) && (measure.graph.children(node.id) ?? []).length > 0,

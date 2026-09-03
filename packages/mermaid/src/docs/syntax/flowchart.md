@@ -1032,9 +1032,8 @@ flowchart LR
   B1 --> B2
 ```
 
-#### Limitation
-
-If any of a subgraph's nodes are linked to the outside, subgraph direction will be ignored. Instead the subgraph will inherit the direction of the parent graph:
+A subgraph keeps its own direction whether it is linked to as a whole or a node inside
+it is linked to directly. Below, both subgraphs stay `TB` inside a `LR` graph:
 
 ```mermaid-example
 flowchart LR
@@ -1048,10 +1047,10 @@ flowchart LR
     end
     %% ^ These subgraphs are identical, except for the links to them:
 
-    %% Link *to* subgraph1: subgraph1 direction is maintained
+    %% Link *to* subgraph1
     outside --> subgraph1
-    %% Link *within* subgraph2:
-    %% subgraph2 inherits the direction of the top-level graph (LR)
+    %% Link *within* subgraph2: the link reaches top2, and subgraph2 still keeps its
+    %% own direction
     outside ---> top2
 ```
 

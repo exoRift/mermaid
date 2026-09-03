@@ -22,6 +22,54 @@ Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.
 
 ---
 
+### getEdgeGroup()?
+
+> `optional` **getEdgeGroup**: (`edge`, `groups`, `context`) => `D3Selection`<`SVGGElement`> | `undefined`
+
+Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:71](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L71)
+
+Where to paint one edge, when `groups.edgePaths` is the wrong layer for it.
+`groups.nodes` is inserted last and so paints over `groups.edgePaths`, which hides
+any edge running under a subgraph that a layout paints as a node.
+
+#### Parameters
+
+##### edge
+
+`Edge`
+
+##### groups
+
+###### clusters
+
+`D3Selection`<`SVGGElement`>
+
+###### edgeLabels
+
+`D3Selection`<`SVGGElement`>
+
+###### edgePaths
+
+`D3Selection`<`SVGGElement`>
+
+###### nodes
+
+`D3Selection`<`SVGGElement`>
+
+###### rootGroups
+
+`D3Selection`<`SVGGElement`>
+
+##### context
+
+[`CommonLayoutPaintContext`](CommonLayoutPaintContext.md)<`unknown`, { `graph`: `Graph`; `groups`: { `clusters`: `D3Selection`<`SVGGElement`>; `edgeLabels`: `D3Selection`<`SVGGElement`>; `edgePaths`: `D3Selection`<`SVGGElement`>; `nodes`: `D3Selection`<`SVGGElement`>; `rootGroups`: `D3Selection`<`SVGGElement`>; }; `nodeElements`: `Map`<`string`, `D3Selection`<`SVGElement` | `SVGGElement`>>; }>
+
+#### Returns
+
+`D3Selection`<`SVGGElement`> | `undefined`
+
+---
+
 ### getEdgeNode()?
 
 > `optional` **getEdgeNode**: (`id`, `edge`, `context`) => `object` | `Node` | `undefined`
@@ -74,7 +122,7 @@ Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.
 
 > `optional` **isCluster**: (`node`, `context`) => `boolean`
 
-Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:70](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L70)
+Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:80](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L80)
 
 #### Parameters
 
@@ -96,7 +144,7 @@ Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.
 
 > `optional` **skipEdge**: (`edge`) => `boolean`
 
-Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:74](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L74)
+Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:84](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L84)
 
 #### Parameters
 
@@ -114,7 +162,7 @@ Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.
 
 > `optional` **skipIntersect**: `boolean` | (`edge`) => `boolean`
 
-Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:75](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L75)
+Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:85](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L85)
 
 ---
 
@@ -122,7 +170,7 @@ Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.
 
 > `optional` **skipNode**: (`node`, `context`) => `boolean`
 
-Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:66](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L66)
+Defined in: [packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts:76](https://github.com/mermaid-js/mermaid/blob/master/packages/mermaid/src/rendering-util/layout-algorithms/common/index.ts#L76)
 
 #### Parameters
 

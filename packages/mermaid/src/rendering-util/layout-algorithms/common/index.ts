@@ -63,6 +63,16 @@ export interface CommonLayoutPaintOptions {
     edge: Edge,
     context: CommonLayoutPaintContext<unknown, CommonLayoutMeasure>
   ) => LayoutData['nodes'][number] | object | undefined;
+  /**
+   * Where to paint one edge, when `groups.edgePaths` is the wrong layer for it.
+   * `groups.nodes` is inserted last and so paints over `groups.edgePaths`, which hides
+   * any edge running under a subgraph that a layout paints as a node.
+   */
+  getEdgeGroup?: (
+    edge: Edge,
+    groups: CommonLayoutMeasure['groups'],
+    context: CommonLayoutPaintContext<unknown, CommonLayoutMeasure>
+  ) => CommonLayoutMeasure['groups']['edgePaths'] | undefined;
   skipNode?: (
     node: LayoutData['nodes'][number],
     context: CommonLayoutPaintContext<unknown, CommonLayoutMeasure>
@@ -292,7 +302,7 @@ async function paintLayoutEdge(
   context: CommonLayoutPaintContext<unknown, CommonLayoutMeasure>
 ): Promise<void> {
   const paths = insertEdge(
-    groups.edgePaths,
+    options.getEdgeGroup?.(edge, groups, context) ?? groups.edgePaths,
     { ...edge },
     options.clusterDb ?? new Map(),
     data4Layout.type,

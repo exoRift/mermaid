@@ -183,6 +183,95 @@ export const findNonClusterChild = (id, graph, clusterId) => {
   return reserve;
 };
 
+/** `TD` and `TB` are the same direction spelled two ways. */
+const normalizeDir = (dir) => (dir === 'TD' ? 'TB' : dir);
+
+/**
+ * The direction a cluster's contents fall back to when the cluster declares none:
+ * the nearest ancestor that does declare one, or failing that the graph itself.
+ */
+const getInheritedDir = (graph, clusterId) => {
+  let parent = graph.parent(clusterId);
+  while (parent) {
+    const dir = clusterDb.get(parent)?.clusterData?.dir;
+    if (dir) {
+      return normalizeDir(dir);
+    }
+    parent = graph.parent(parent);
+  }
+  return normalizeDir(graph.graph()?.rankdir);
+};
+
+/**
+ * Whether a cluster asks for a direction that differs from the one it would inherit.
+ * Only those clusters need the treatment below — a subgraph that already flows the
+ * way its surroundings do has nothing to lose by being laid out alongside them.
+ */
+const hasOwnDirection = (graph, clusterId) => {
+  const dir = clusterDb.get(clusterId)?.clusterData?.dir;
+  return Boolean(dir) && normalizeDir(dir) !== getInheritedDir(graph, clusterId);
+};
+
+/**
+ * The outermost cluster with a direction of its own that sits between `node` and
+ * `other` — the frame this edge crosses that has to stay whole. Outermost wins:
+ * re-pointing at a nested frame would still leave the edge crossing the outer one.
+ */
+const crossedDirectedCluster = (graph, node, other) => {
+  const ancestors = [];
+  let parent = graph.parent(node);
+  while (parent) {
+    ancestors.unshift(parent);
+    parent = graph.parent(parent);
+  }
+  return ancestors.find(
+    (ancestor) =>
+      other !== ancestor && !isDescendant(other, ancestor) && hasOwnDirection(graph, ancestor)
+  );
+};
+
+/**
+ * Anchor edges that reach past the frame of a subgraph with its own direction onto
+ * that frame instead.
+ *
+ * Dagre gives a graph a single `rankdir`, so a subgraph only keeps a direction of
+ * its own when `extractor` lifts it into a graph of its own — and that happens only
+ * while nothing connects across its frame. An edge written against a subgraph's id
+ * (`B --> Sub`) already anchors there and so leaves the direction intact; one written
+ * against a node inside it (`B --> B1`) did not, which is what cost the subgraph its
+ * direction. Re-pointing the latter at the frame puts both spellings on the same
+ * footing.
+ */
+const anchorEdgesOnDirectedClusters = (graph) => {
+  graph.edges().forEach((e) => {
+    const v = crossedDirectedCluster(graph, e.v, e.w) ?? e.v;
+    const w = crossedDirectedCluster(graph, e.w, e.v) ?? e.w;
+    if (v === e.v && w === e.w) {
+      return;
+    }
+    if (v === w) {
+      // Both ends landed on the same frame — leave the edge where it is rather than
+      // turning it into a self-loop on the subgraph.
+      return;
+    }
+    const edge = graph.edge(e.v, e.w, e.name);
+    log.debug('Anchoring edge', e.v, '->', e.w, 'on', v, '->', w);
+    // The frame is only as far as dagre can lay the edge out — it has no idea the
+    // subgraph has an inside. The node the author wrote is kept so the drawn path can
+    // carry on across the frame and finish on it.
+    if (v !== e.v) {
+      edge.terminalStart = e.v;
+      edge.terminalStartAnchor = v;
+    }
+    if (w !== e.w) {
+      edge.terminalEnd = e.w;
+      edge.terminalEndAnchor = w;
+    }
+    graph.removeEdge(e.v, e.w, e.name);
+    graph.setEdge(v, w, edge, e.name);
+  });
+};
+
 const getAnchorId = (id) => {
   if (!clusterDb.has(id)) {
     return id;
@@ -218,6 +307,11 @@ export const adjustClustersAndEdges = (graph, depth) => {
       clusterDb.set(id, { id: findNonClusterChild(id, graph, id), clusterData: graph.node(id) });
     }
   });
+
+  // Before any edge is counted against a cluster: an edge that reaches past the frame
+  // of a subgraph with its own direction is anchored on the frame, so that the cluster
+  // comes out of the next loop without external connections and stays extractable.
+  anchorEdgesOnDirectedClusters(graph);
 
   graph.nodes().forEach(function (id) {
     const children = graph.children(id);

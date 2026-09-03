@@ -660,7 +660,15 @@ export function buildElkGraphFromLayoutData(
   addVertices(data4Layout.nodes, elkGraph, nodeDb, elkContext);
   addEdgesToElkGraph(data4Layout, elkGraph, nodeDb, elkContext);
   configureSubgraphNodes(data4Layout, nodeDb, parentLookupDb, elkContext);
-  configureCrossHierarchyEdges(elkGraph, nodeDb, parentLookupDb, elkContext.log);
+  const directedContainers = collectDirectedContainers(data4Layout, nodeDb);
+  splitEdgesAtDirectedContainers(elkGraph, nodeDb, directedContainers, elkContext.log);
+  configureCrossHierarchyEdges(
+    elkGraph,
+    nodeDb,
+    parentLookupDb,
+    elkContext.log,
+    directedContainers
+  );
   applyCyclicEntryConstraint(data4Layout, nodeDb);
 
   return { elkGraph, nodeDb, parentLookupDb };
@@ -1007,6 +1015,47 @@ function addVertex(
   }
 }
 
+/**
+ * A dimension a node's own styles pin to a small fixed size, in pixels.
+ *
+ * `classDef hidden width: 1px, height: 1px` is the junction idiom: an invisible dot for
+ * fanning a flow out. The style resizes only the painted shape, so without this the node
+ * is laid out at the size of its (invisible) label — ELK spreads edge anchors across
+ * that phantom width and lines neighbours up with them, which bends what should be a
+ * straight run through the junction. Only sizes small enough to be a point marker are
+ * honoured; a style that shrinks a real text node below its label is left to the painter.
+ */
+const JUNCTION_STYLE_SIZE_LIMIT = 20;
+function styledJunctionSize(node: Node): { width: number; height: number } | undefined {
+  const styled = node as unknown as { cssStyles?: string[]; cssCompiledStyles?: string[] };
+  // Both sources: `style` on the node lands in `cssStyles`, while a `classDef` — which is
+  // how the junction idiom is written — is compiled into `cssCompiledStyles`. Reading only
+  // the former misses every `:::class` node, which is nearly all of them.
+  const styles = [...(styled.cssCompiledStyles ?? []), ...(styled.cssStyles ?? [])];
+  if (styles.length === 0) {
+    return undefined;
+  }
+  const dimension = (name: 'width' | 'height') => {
+    let found;
+    for (const style of styles) {
+      const match = /^\s*(width|height)\s*:\s*([\d.]+)px\s*$/.exec(style);
+      if (match && match[1] === name) {
+        // Last wins, the way the cascade resolves it.
+        found = Number(match[2]);
+      }
+    }
+    return found;
+  };
+  const width = dimension('width');
+  const height = dimension('height');
+  return width !== undefined &&
+    height !== undefined &&
+    width <= JUNCTION_STYLE_SIZE_LIMIT &&
+    height <= JUNCTION_STYLE_SIZE_LIMIT
+    ? { width, height }
+    : undefined;
+}
+
 function createElkNode(node: Node): NodeWithVertex {
   const child = { ...node } as NodeWithVertex;
   delete (child as { domId?: unknown }).domId;
@@ -1014,8 +1063,9 @@ function createElkNode(node: Node): NodeWithVertex {
   if (node.isGroup) {
     child.children = [];
   } else {
-    child.width = node.width ?? 0;
-    child.height = node.height ?? 0;
+    const junction = styledJunctionSize(node);
+    child.width = junction?.width ?? node.width ?? 0;
+    child.height = junction?.height ?? node.height ?? 0;
   }
 
   return child;
@@ -1140,25 +1190,267 @@ function configureSubgraphNodes(
   });
 }
 
+/** `TD` and `TB` are the same direction spelled two ways. */
+function normalizeDir(dir: unknown): string | undefined {
+  return dir === 'TD' ? 'TB' : (dir as string | undefined);
+}
+
+/**
+ * The containers that ask for a direction differing from the one they would inherit.
+ *
+ * Only these have anything to lose by being folded into the root's layout, and the
+ * comparison matters: `inheritDir` stamps the parent's direction onto every subgraph,
+ * so testing `node.dir` alone would isolate subgraphs that render correctly today.
+ * Containers that named their own algorithm are excluded — `buildSubgraphLayoutOptions`
+ * gives those no `elk.direction` at all, which is the condition read back here.
+ */
+function collectDirectedContainers(
+  data4Layout: LayoutData,
+  nodeDb: Record<string, NodeWithVertex>
+): Map<string, string | undefined> {
+  const rootDir = normalizeDir((data4Layout as { direction?: string }).direction);
+  const inheritedDir = (id: string) => {
+    let parentId = nodeDb[id]?.parentId;
+    while (parentId) {
+      const dir = normalizeDir(nodeDb[parentId]?.dir);
+      if (dir) {
+        return dir;
+      }
+      parentId = nodeDb[parentId]?.parentId;
+    }
+    return rootDir;
+  };
+
+  // Keyed by container, valued by the direction the graph around it flows in — which is
+  // what says where on the frame an edge should arrive and leave.
+  const directed = new Map<string, string | undefined>();
+  for (const { id } of data4Layout.nodes) {
+    const node = nodeDb[id];
+    const dir = normalizeDir(node?.dir);
+    const outerDir = inheritedDir(id);
+    if (dir && dir !== outerDir && node?.layoutOptions?.['elk.direction'] !== undefined) {
+      directed.set(id, outerDir);
+    }
+  }
+  return directed;
+}
+
+/**
+ * Which side of a frame an edge should arrive on and leave from: the sides the frame's OWN
+ * flow enters and leaves by. In a layered layout those ports join the first and last layer
+ * like nodes, so ELK lines each one up with the node it serves and the attachment leg is a
+ * straight run. A port on a flank instead gets pinned to the layer of its node — the very
+ * corner of the frame for the last one — and the leg has to crawl along the border to
+ * reach it.
+ */
+function portSidesFor(ownDir: string | undefined): { entry: string; exit: string } {
+  switch (ownDir) {
+    case 'LR':
+      return { entry: 'WEST', exit: 'EAST' };
+    case 'RL':
+      return { entry: 'EAST', exit: 'WEST' };
+    case 'BT':
+      return { entry: 'SOUTH', exit: 'NORTH' };
+    case 'TB':
+    default:
+      return { entry: 'NORTH', exit: 'SOUTH' };
+  }
+}
+
+/**
+ * Split edges that reach past the frame of a subgraph with its own direction at a port on
+ * that frame, so ELK routes both halves itself.
+ *
+ * `elk.layered` only honours a container's `elk.direction` under SEPARATE_CHILDREN, and it
+ * refuses outright — `UnsupportedGraphException` — to route an edge that crosses into such
+ * a container. A hierarchical port is its own supported way across: the edge runs to a port
+ * on the frame, and a second edge inside the container runs from that port to the node. ELK
+ * then routes both halves the way it routes anything else, and grows the container to make
+ * room. `applyElkEdgeLayout` stitches them back into the single edge the author wrote.
+ */
+function splitEdgesAtDirectedContainers(
+  elkGraph: { edges: any[] },
+  nodeDb: Record<string, NodeWithVertex>,
+  directedContainers: Map<string, string | undefined>,
+  log: ElkLayoutContext['log']
+): void {
+  if (directedContainers.size === 0) {
+    return;
+  }
+
+  /** Enclosing containers, outermost first. */
+  const ancestorsOf = (id: string) => {
+    const chain: string[] = [];
+    let parentId = nodeDb[id]?.parentId;
+    while (parentId) {
+      chain.unshift(parentId);
+      parentId = nodeDb[parentId]?.parentId;
+    }
+    return chain;
+  };
+
+  /**
+   * Every directed frame between the edge's other end and this endpoint, outermost first.
+   * Each one has to be crossed at a port of its own: a port on the outermost alone would
+   * still leave the inner half crossing the frames nested inside it, which ELK will not
+   * route.
+   */
+  const crossedChain = (id: string, other: string): string[] => {
+    const ancestors = ancestorsOf(id);
+    const otherAncestors = ancestorsOf(other);
+    const first = ancestors.findIndex(
+      (ancestor) =>
+        directedContainers.has(ancestor) && other !== ancestor && !otherAncestors.includes(ancestor)
+    );
+    return first === -1
+      ? []
+      : ancestors.slice(first).filter((ancestor) => directedContainers.has(ancestor));
+  };
+
+  const portedContainers = new Set<string>();
+  const addPort = (containerId: string, portId: string, side: string) => {
+    portedContainers.add(containerId);
+    const container = nodeDb[containerId] as NodeWithVertex & { ports?: any[]; edges?: any[] };
+    container.ports ??= [];
+    // A port has no size of its own — it is the point on the frame the edge attaches to.
+    // Its side faces the surrounding flow, so an edge between two frames leaves the one
+    // and meets the next the way any edge between two plain nodes would.
+    container.ports.push({
+      id: portId,
+      width: 1,
+      height: 1,
+      layoutOptions: { 'elk.port.side': side },
+    });
+    container.layoutOptions ??= {};
+    container.layoutOptions['elk.portConstraints'] = 'FIXED_SIDE';
+    return portId;
+  };
+
+  const addInnerEdge = (containerId: string, innerEdge: any) => {
+    const container = nodeDb[containerId] as NodeWithVertex & { edges?: any[] };
+    container.edges ??= [];
+    container.edges.push(innerEdge);
+  };
+
+  let anySplit = false;
+  for (const edge of elkGraph.edges) {
+    const source = edge.sources[0];
+    const target = edge.targets[0];
+    const sourceChain = crossedChain(source, target);
+    const targetChain = crossedChain(target, source);
+    if (sourceChain.length === 0 && targetChain.length === 0) {
+      continue;
+    }
+
+    log.debug('Splitting edge', source, '->', target, 'at', sourceChain, targetChain);
+    const innerSegments: { id: string; containerId: string; position: 'start' | 'end' }[] = [];
+
+    // Walk each chain outermost-in. At every frame the piece so far is re-attached to a
+    // new port on it, and a fresh piece continues inside — reaching the node itself only
+    // in the innermost frame.
+    let sourcePiece = edge;
+    sourceChain.forEach((containerId, level) => {
+      const portId = addPort(
+        containerId,
+        `${edge.id}__exit${level}`,
+        portSidesFor(normalizeDir(nodeDb[containerId]?.dir)).exit
+      );
+      sourcePiece.sources = [portId];
+      const innerEdge = { id: `${edge.id}__from${level}`, sources: [source], targets: [portId] };
+      addInnerEdge(containerId, innerEdge);
+      innerSegments.push({ id: innerEdge.id, containerId, position: 'start' });
+      sourcePiece = innerEdge;
+    });
+
+    let targetPiece = edge;
+    targetChain.forEach((containerId, level) => {
+      const portId = addPort(
+        containerId,
+        `${edge.id}__entry${level}`,
+        portSidesFor(normalizeDir(nodeDb[containerId]?.dir)).entry
+      );
+      targetPiece.targets = [portId];
+      const innerEdge = { id: `${edge.id}__to${level}`, sources: [portId], targets: [target] };
+      addInnerEdge(containerId, innerEdge);
+      innerSegments.push({ id: innerEdge.id, containerId, position: 'end' });
+      targetPiece = innerEdge;
+    });
+
+    edge.innerSegments = innerSegments;
+    // `start`/`end` are what `applyElkEdgeLayout` resolves the outer section against, and
+    // that section is relative to the frames the ports sit on. The edge here is the copy
+    // `addEdgesToElkGraph` pushed, so the diagram's own edge — and with it the arrow, label
+    // and id — is untouched.
+    edge.start = sourceChain[0] ?? source;
+    edge.end = targetChain[0] ?? target;
+    edge.sourceId = edge.start;
+    edge.targetId = edge.end;
+    // The nodes the author wrote, so the stitched path is clipped to them and not to frames.
+    edge.terminalSource = sourceChain.length > 0 ? source : undefined;
+    edge.terminalTarget = targetChain.length > 0 ? target : undefined;
+    anySplit = true;
+  }
+
+  // A port edge runs to the frame through the layers between, and its dummy takes a slot
+  // in each one — right below the junction it serves, which shoves whatever else lives in
+  // that layer aside and puts a dog-leg in the middle of a straight chain. Giving the
+  // author's own edges the greater claim to straightness moves the dummy aside instead.
+  // Scoped to the containers that actually hold ports; everywhere else the priority stays
+  // as it was.
+  if (portedContainers.size > 0) {
+    for (const edge of elkGraph.edges) {
+      if (edge.innerSegments) {
+        continue;
+      }
+      const shared = ancestorsOf(edge.sources[0]).filter(
+        (ancestor) =>
+          portedContainers.has(ancestor) && ancestorsOf(edge.targets[0]).includes(ancestor)
+      );
+      if (shared.length > 0) {
+        edge.layoutOptions = {
+          ...edge.layoutOptions,
+          'elk.layered.priority.straightness': 10,
+        };
+      }
+    }
+  }
+
+  if (anySplit) {
+    // The placement strategies that straighten edges line a port up with the node it
+    // serves — the entry beside a TB container's first node, the exit beside its last, a
+    // whole container height apart — and then walk each container that far down the page
+    // to straighten the edge between two of them. SIMPLE places layer by layer without
+    // chasing port positions, so the containers stay in a row. Scoped to graphs where a
+    // split actually happened: only they have hierarchical ports to be dragged around by,
+    // and their layout is changing here anyway.
+    (elkGraph as unknown as { layoutOptions: Record<string, unknown> }).layoutOptions[
+      'elk.layered.nodePlacement.strategy'
+    ] = 'SIMPLE';
+  }
+}
+
 function configureCrossHierarchyEdges(
   elkGraph: { edges: any[] },
   nodeDb: Record<string, NodeWithVertex>,
   parentLookupDb: TreeData,
-  log: ElkLayoutContext['log']
+  log: ElkLayoutContext['log'],
+  directedContainers: Map<string, string | undefined>
 ): void {
   log.debug('APA01 processing edges, count:', elkGraph.edges.length);
   elkGraph.edges.forEach((edge: any, index: number) => {
     log.debug('APA01 processing edge', index, ':', edge);
-    const source = edge.sources[0];
-    const target = edge.targets[0];
+    // A split edge attaches to ports rather than nodes; `start`/`end` name the frames
+    // those ports sit on, which is what the hierarchy below has to be reasoned about.
+    const source = nodeDb[edge.sources[0]] ? edge.sources[0] : edge.start;
+    const target = nodeDb[edge.targets[0]] ? edge.targets[0] : edge.end;
     log.debug('APA01 source:', source, 'target:', target);
     log.debug('APA01 nodeDb[source]:', nodeDb[source]);
     log.debug('APA01 nodeDb[target]:', nodeDb[target]);
 
     if (nodeDb[source] && nodeDb[target] && nodeDb[source].parentId !== nodeDb[target].parentId) {
       const ancestorId = findCommonAncestor(source, target, parentLookupDb);
-      setIncludeChildrenPolicy(nodeDb, source, ancestorId, log);
-      setIncludeChildrenPolicy(nodeDb, target, ancestorId, log);
+      setIncludeChildrenPolicy(nodeDb, source, ancestorId, log, directedContainers);
+      setIncludeChildrenPolicy(nodeDb, target, ancestorId, log, directedContainers);
     }
   });
 }
@@ -1167,13 +1459,27 @@ function setIncludeChildrenPolicy(
   nodeDb: Record<string, NodeWithVertex>,
   nodeId: string,
   ancestorId: string,
-  log: ElkLayoutContext['log']
+  log: ElkLayoutContext['log'],
+  directedContainers: Map<string, string | undefined>
 ): void {
   const node = nodeDb[nodeId];
 
   if (!node) {
     return;
   }
+
+  // A container with a direction of its own is only ever reached as an edge's own
+  // endpoint now — `splitEdgesAtDirectedContainers` cut every edge that used to cross its
+  // frame in two at a port on it. The outer half stops at that port, so nothing needs to
+  // enter the container, and relaxing it to INCLUDE_CHILDREN would only throw its direction
+  // away. Its ancestors still need relaxing, so keep walking up.
+  if (directedContainers.has(nodeId)) {
+    if (node.id !== ancestorId && node.parentId) {
+      setIncludeChildrenPolicy(nodeDb, node.parentId, ancestorId, log, directedContainers);
+    }
+    return;
+  }
+
   node.layoutOptions ??= {};
 
   // If this node has a user-specified custom algorithm (e.g. elk.box) with
@@ -1190,7 +1496,7 @@ function setIncludeChildrenPolicy(
 
   node.layoutOptions['elk.hierarchyHandling'] = 'INCLUDE_CHILDREN';
   if (node.id !== ancestorId && node.parentId) {
-    setIncludeChildrenPolicy(nodeDb, node.parentId, ancestorId, log);
+    setIncludeChildrenPolicy(nodeDb, node.parentId, ancestorId, log, directedContainers);
   }
 }
 
@@ -1691,6 +1997,61 @@ function straightenEdgeTerminals(edges: Edge[]): void {
   }
 }
 
+/**
+ * Every edge in the laid-out tree, by id — including the halves of a split edge, which ELK
+ * returns on the container they were routed inside rather than next to the outer half.
+ */
+function collectEdgeSections(graph: ElkLayoutResult): Map<string, any> {
+  const byId = new Map<string, any>();
+  const walk = (node: any) => {
+    for (const edge of node.edges ?? []) {
+      byId.set(edge.id, edge);
+    }
+    for (const child of node.children ?? []) {
+      walk(child);
+    }
+  };
+  walk(graph);
+  return byId;
+}
+
+/**
+ * The points ELK routed for the half of a split edge that runs inside a container.
+ *
+ * They come back relative to where ELK put that container, so they are shifted by its
+ * origin — `elkOrigin` when `evenGroupFrames` has since moved the frame, since the route
+ * was laid out against the original.
+ */
+function innerSegmentPoints(
+  edge: any,
+  position: 'start' | 'end',
+  sectionsById: Map<string, any>,
+  nodeDb: Record<string, NodeWithVertex>
+): P[] {
+  const segments = (edge.innerSegments ?? []).filter((s: any) => s.position === position);
+  if (position === 'start') {
+    // Pieces are recorded outermost-in; on the start side the path runs the other way,
+    // from the node out through each frame.
+    segments.reverse();
+  }
+  const points: P[] = [];
+  for (const segment of segments) {
+    const section = sectionsById.get(segment.id)?.sections?.[0];
+    if (!section) {
+      continue;
+    }
+    const container = nodeDb[segment.containerId];
+    const origin = container?.elkOrigin ?? container?.offset;
+    points.push(
+      ...createEdgePointsFromSection(section, {
+        x: origin?.posX ?? 0,
+        y: origin?.posY ?? 0,
+      })
+    );
+  }
+  return points;
+}
+
 function applyElkEdgeLayout(
   data4Layout: LayoutData,
   graph: ElkLayoutResult,
@@ -1700,6 +2061,9 @@ function applyElkEdgeLayout(
   const edgeById = new Map(data4Layout.edges.map((edge) => [edge.id, edge]));
   // Opt-out rather than opt-in: the step this removes is never intentional.
   const straightenEdges = data4Layout.config.elk?.straightenEdges !== false;
+  // The halves of a split edge come back on the containers they were routed inside, not at
+  // the root alongside the edge they belong to.
+  const sectionsById = collectEdgeSections(graph);
 
   // Alignment pre-pass: move degenerately-anchored small nodes onto their routed
   // lines BEFORE any edge points are built, so every edge — whichever side of the
@@ -1745,14 +2109,17 @@ function applyElkEdgeLayout(
       return;
     }
 
-    const startId = edge.sources?.[0] ?? edge.start;
-    const endId = edge.targets?.[0] ?? edge.end;
+    // An edge routed to a directional subgraph's frame is still the author's edge to
+    // the node inside it — the frame is only as far as ELK would carry it, because it
+    // cannot route into a container it lays out separately. So the path is terminated
+    // and clipped on the node that was written, and the last leg crosses the frame.
+    const startId = edge.terminalSource ?? edge.sources?.[0] ?? edge.start;
+    const endId = edge.terminalTarget ?? edge.targets?.[0] ?? edge.end;
     const startNode = layoutState.nodeDb[startId];
     const endNode = layoutState.nodeDb[endId];
     if (!startNode || !endNode) {
       return;
     }
-
     // `elk.box` and `elk.rectpacking` place nodes but never route edges, so ELK
     // returns no sections. Guarded on length, not presence: an empty array would
     // otherwise skip the fallback and hand `undefined` to
@@ -1796,7 +2163,13 @@ function applyElkEdgeLayout(
     log.debug('APA18 offset', offset, sourceId, ' ==> ', targetId, 'edge:', edge, startNode);
 
     const section = edge.sections[0];
-    const points = createEdgePointsFromSection(section, offset);
+    // A split edge is three routes ELK laid out separately — inside the source's frame,
+    // between the frames, and inside the target's — joined back into the one path.
+    const points = [
+      ...innerSegmentPoints(edge, 'start', sectionsById, layoutState.nodeDb),
+      ...createEdgePointsFromSection(section, offset),
+      ...innerSegmentPoints(edge, 'end', sectionsById, layoutState.nodeDb),
+    ];
     startNode.x = startNode.offset!.posX + startNode.width! / 2;
     startNode.y = startNode.offset!.posY + startNode.height! / 2;
     endNode.x = endNode.offset!.posX + endNode.width! / 2;
