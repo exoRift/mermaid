@@ -80,6 +80,8 @@ interface ElkSubgraphConfig {
   nodePlacementAlignment?: string;
   nodePlacementStrategy?: string;
   cycleBreakingStrategy?: string;
+  considerModelOrder?: string;
+  forceNodeModelOrder?: boolean;
 }
 
 interface ElkPreparedLayout {
@@ -431,6 +433,14 @@ export function buildSubgraphLayoutOptions(
     layoutOptions['elk.algorithm'] = algorithm;
     layoutOptions['elk.direction'] = dir2ElkDirection(node.dir);
     layoutOptions['elk.hierarchyHandling'] = 'SEPARATE_CHILDREN';
+    // Laid out on its own, the subgraph never sees the root's model order
+    // options and falls back to ELK's default, NONE, which leaves the order of
+    // its siblings to crossing minimisation alone. Same keys and same values as
+    // the root, so a subgraph keeps the order it was written in just as the
+    // rest of the diagram does.
+    layoutOptions['elk.layered.considerModelOrder.strategy'] = elkConfig?.considerModelOrder;
+    layoutOptions['elk.layered.crossingMinimization.forceNodeModelOrder'] =
+      elkConfig?.forceNodeModelOrder;
   }
 
   // Container-scoped experiments. Spacing, padding and label placement only

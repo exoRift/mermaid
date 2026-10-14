@@ -92,6 +92,26 @@ describe('buildSubgraphLayoutOptions', () => {
     expect(opts['elk.hierarchyHandling']).toBe('SEPARATE_CHILDREN');
   });
 
+  it('propagates model order options to subgraphs with an explicit direction', () => {
+    const opts = buildSubgraphLayoutOptions(
+      { dir: 'TB' },
+      { considerModelOrder: 'NODES_AND_EDGES', forceNodeModelOrder: true },
+      'layered'
+    );
+    expect(opts['elk.layered.considerModelOrder.strategy']).toBe('NODES_AND_EDGES');
+    expect(opts['elk.layered.crossingMinimization.forceNodeModelOrder']).toBe(true);
+  });
+
+  it('leaves model order to the root for subgraphs without an explicit direction', () => {
+    const opts = buildSubgraphLayoutOptions(
+      {},
+      { considerModelOrder: 'NODES_AND_EDGES', forceNodeModelOrder: true },
+      'layered'
+    );
+    expect(opts['elk.layered.considerModelOrder.strategy']).toBeUndefined();
+    expect(opts['elk.layered.crossingMinimization.forceNodeModelOrder']).toBeUndefined();
+  });
+
   it('ignores an unsupported metadata algorithm and falls back to the dir branch', () => {
     const opts = buildSubgraphLayoutOptions(
       { dir: 'LR', labelData: { width: 30, height: 14 }, metadata: { algorithm: 'elk.garbage' } },
