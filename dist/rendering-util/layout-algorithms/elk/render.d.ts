@@ -57,6 +57,8 @@ interface ElkSubgraphConfig {
     nodePlacementAlignment?: string;
     nodePlacementStrategy?: string;
     cycleBreakingStrategy?: string;
+    considerModelOrder?: string;
+    forceNodeModelOrder?: boolean;
 }
 interface ElkPreparedLayout {
     algorithm?: string;

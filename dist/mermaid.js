@@ -159887,6 +159887,8 @@ You have to call mermaid.initialize.`
       layoutOptions["elk.algorithm"] = algorithm;
       layoutOptions["elk.direction"] = dir2ElkDirection(node2.dir);
       layoutOptions["elk.hierarchyHandling"] = "SEPARATE_CHILDREN";
+      layoutOptions["elk.layered.considerModelOrder.strategy"] = elkConfig?.considerModelOrder;
+      layoutOptions["elk.layered.crossingMinimization.forceNodeModelOrder"] = elkConfig?.forceNodeModelOrder;
     }
     Object.assign(layoutOptions, SUBGRAPH_EXPERIMENT_OVERRIDES);
     return layoutOptions;
